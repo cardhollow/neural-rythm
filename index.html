@@ -197,6 +197,7 @@ startBtn.addEventListener('click',async()=>{
   game=buildGame(midi);
 
   setupAudio();
+  document.documentElement.requestFullscreen?.();
   if(audio&&audio.state!=='running'){
     try{await audio.resume()}catch{}
   }
@@ -966,10 +967,1034 @@ function makeTickConverter(tempos,tpq){
 }
 
 })();
-  document.addEventListener('click',()=>{
-  document.documentElement.requestFullscreen?.();
-},{once:true});
 </script>
+<script>
+(() => {
+'use strict';
 
+const AUTO={
+  enabled:true,
+
+  /*
+   * The game starts its internal clock at:
+   * performance.now() + 1500
+   */
+  lead:1500,
+
+  /*
+   * setTimeout normally fires slightly late.
+   * A small negative offset puts the synthetic press
+   * closer to the center of the game's HIT window.
+   */
+  timingOffset:-8,
+
+  /*
+   * IMPORTANT:
+   * Hold notes must remain pressed past their MIDI end.
+   * Otherwise the game's update() can see the key released
+   * before judgeTail() runs.
+   */
+  releaseGrace:55,
+
+  timers:[],
+  midi:null,
+  running:false,
+
+  keyDown:new Set()
+};
+
+const LETTERS='ABCDEFGHIJKLMNOPQRSTUVWXYZ';
+
+const fileInput=document.getElementById('file');
+const difficultySelect=document.getElementById('difficulty');
+const startBtn=document.getElementById('start');
+
+
+/* =========================================================
+   TIMER MANAGEMENT
+========================================================= */
+
+function clearTimers(){
+  for(const t of AUTO.timers){
+    clearTimeout(t);
+    cancelAnimationFrame(t);
+  }
+
+  AUTO.timers.length=0;
+}
+
+
+/* =========================================================
+   SYNTHETIC KEY EVENTS
+========================================================= */
+
+function dispatchKey(type,letter){
+
+  const code='Key'+letter;
+
+  const ev=new KeyboardEvent(type,{
+    key:letter.toLowerCase(),
+    code,
+    location:0,
+    bubbles:true,
+    cancelable:true,
+    repeat:false
+  });
+
+  window.dispatchEvent(ev);
+}
+
+function press(letter){
+
+  dispatchKey('keydown',letter);
+  AUTO.keyDown.add(letter);
+}
+
+function release(letter){
+
+  dispatchKey('keyup',letter);
+  AUTO.keyDown.delete(letter);
+}
+
+
+/*
+ * The game's listener ignores keydown if its activeKeys Set
+ * already contains the letter.
+ *
+ * Therefore every new note on an already-active letter gets
+ * a synchronous KEYUP + KEYDOWN pair.
+ *
+ * Because both happen in the SAME task, the game animation
+ * loop cannot normally observe the temporary release.
+ */
+function retrigger(letter){
+
+  if(AUTO.keyDown.has(letter)){
+
+    dispatchKey('keyup',letter);
+
+    dispatchKey('keydown',letter);
+
+  }else{
+
+    press(letter);
+
+    return;
+  }
+
+  AUTO.keyDown.add(letter);
+}
+
+
+/* =========================================================
+   MIDI PARSER
+========================================================= */
+
+function parseMidi(buffer){
+
+  const dv=new DataView(buffer);
+  let p=0;
+
+  const u8=()=>{
+    return dv.getUint8(p++);
+  };
+
+  const u16=()=>{
+    const v=dv.getUint16(p,false);
+    p+=2;
+    return v;
+  };
+
+  const u32=()=>{
+    const v=dv.getUint32(p,false);
+    p+=4;
+    return v;
+  };
+
+  const text=n=>{
+    let s='';
+
+    for(let i=0;i<n;i++){
+      s+=String.fromCharCode(u8());
+    }
+
+    return s;
+  };
+
+  function vlq(){
+
+    let v=0;
+
+    while(true){
+
+      const b=u8();
+
+      v=(v<<7)|(b&127);
+
+      if(!(b&128)){
+        return v;
+      }
+    }
+  }
+
+  if(text(4)!=='MThd'){
+    throw Error('Invalid MIDI');
+  }
+
+  const headerLen=u32();
+
+  u16();
+
+  const trackCount=u16();
+
+  const division=u16();
+
+  p=8+headerLen;
+
+  const tempos=[
+    {
+      tick:0,
+      mpq:500000
+    }
+  ];
+
+  const notes=[];
+
+  for(let tr=0;tr<trackCount;tr++){
+
+    if(text(4)!=='MTrk'){
+      throw Error('Invalid MIDI track');
+    }
+
+    const len=u32();
+
+    const end=p+len;
+
+    let tick=0;
+    let running=0;
+
+    const active=new Map();
+
+    const close=(ch,note,t)=>{
+
+      const key=ch+':'+note;
+
+      const item=active.get(key);
+
+      if(!item)return;
+
+      notes.push({
+        note,
+        start:item.tick,
+        end:Math.max(item.tick+1,t),
+        velocity:item.velocity,
+        channel:ch
+      });
+
+      active.delete(key);
+    };
+
+    while(p<end){
+
+      tick+=vlq();
+
+      let st=u8();
+
+      if(st<128){
+
+        if(!running){
+          throw Error('Bad running status');
+        }
+
+        p--;
+
+        st=running;
+
+      }else if(st<240){
+
+        running=st;
+
+      }else{
+
+        running=0;
+      }
+
+      if(st===255){
+
+        const type=u8();
+
+        const len2=vlq();
+
+        if(type===81&&len2===3){
+
+          const mpq=
+            (u8()<<16)|
+            (u8()<<8)|
+            u8();
+
+          tempos.push({
+            tick,
+            mpq
+          });
+
+        }else{
+
+          p+=len2;
+        }
+
+        continue;
+      }
+
+      if(st===240||st===247){
+
+        p+=vlq();
+
+        continue;
+      }
+
+      const type=st&240;
+
+      const ch=st&15;
+
+      const d1=u8();
+
+      if(type===192||type===208){
+        continue;
+      }
+
+      const d2=u8();
+
+      if(type===144){
+
+        if(d2===0){
+
+          close(ch,d1,tick);
+
+        }else{
+
+          active.set(
+            ch+':'+d1,
+            {
+              tick,
+              velocity:d2
+            }
+          );
+        }
+
+      }else if(type===128){
+
+        close(ch,d1,tick);
+      }
+    }
+
+    for(const [key,item] of active){
+
+      const [ch,note]=key
+        .split(':')
+        .map(Number);
+
+      notes.push({
+        note,
+        start:item.tick,
+        end:Math.max(item.tick+1,tick),
+        velocity:item.velocity,
+        channel:ch
+      });
+    }
+  }
+
+  tempos.sort(
+    (a,b)=>a.tick-b.tick
+  );
+
+  const merged=[];
+
+  for(const t of tempos){
+
+    const last=
+      merged[merged.length-1];
+
+    if(last&&last.tick===t.tick){
+
+      last.mpq=t.mpq;
+
+    }else{
+
+      merged.push({
+        tick:t.tick,
+        mpq:t.mpq
+      });
+    }
+  }
+
+  let cursorTick=0;
+  let cursorSec=0;
+
+  let mpq=
+    merged[0]?.mpq||
+    500000;
+
+  const segments=[];
+
+  for(const t of merged){
+
+    if(t.tick<cursorTick){
+      continue;
+    }
+
+    cursorSec+=
+      (t.tick-cursorTick)*
+      mpq/
+      1000000/
+      division;
+
+    cursorTick=t.tick;
+
+    mpq=t.mpq;
+
+    segments.push({
+      tick:cursorTick,
+      sec:cursorSec,
+      mpq
+    });
+  }
+
+  if(!segments.length){
+
+    segments.push({
+      tick:0,
+      sec:0,
+      mpq:500000
+    });
+  }
+
+  const tickToSec=tick=>{
+
+    let lo=0;
+    let hi=segments.length-1;
+
+    while(lo<hi){
+
+      const mid=
+        Math.ceil((lo+hi)/2);
+
+      if(segments[mid].tick<=tick){
+
+        lo=mid;
+
+      }else{
+
+        hi=mid-1;
+      }
+    }
+
+    const s=segments[lo];
+
+    return s.sec+
+      (tick-s.tick)*
+      s.mpq/
+      1000000/
+      division;
+  };
+
+  for(const n of notes){
+
+    n.start=tickToSec(n.start);
+
+    n.end=Math.max(
+      n.start+.04,
+      tickToSec(n.end)
+    );
+  }
+
+  notes.sort(
+    (a,b)=>
+      a.start-b.start||
+      a.note-b.note
+  );
+
+  return{
+    notes,
+    duration:notes.reduce(
+      (m,n)=>
+        Math.max(m,n.end),
+      0
+    )
+  };
+}
+
+
+/* =========================================================
+   LOAD MIDI
+========================================================= */
+
+async function loadMidi(){
+
+  const f=fileInput?.files?.[0];
+
+  if(!f){
+    return null;
+  }
+
+  try{
+
+    AUTO.midi=
+      parseMidi(
+        await f.arrayBuffer()
+      );
+
+    return AUTO.midi;
+
+  }catch(err){
+
+    console.error(
+      '[Neural Rhythm Auto Keyboard] MIDI parse error:',
+      err
+    );
+
+    AUTO.midi=null;
+
+    return null;
+  }
+}
+
+
+/* =========================================================
+   EXACT SAME NOTE → LETTER MAPPING AS THE GAME
+========================================================= */
+
+function buildEvents(midi){
+
+  if(!midi||!midi.notes.length){
+    return[];
+  }
+
+  const allPitches=
+    midi.notes.map(
+      n=>n.note
+    );
+
+  const minPitch=
+    Math.min(...allPitches);
+
+  const maxPitch=
+    Math.max(...allPitches);
+
+  const pitchRange=
+    Math.max(
+      1,
+      maxPitch-minPitch
+    );
+
+  const targetNodes=
+    parseInt(
+      difficultySelect?.value,
+      10
+    )||8;
+
+  const uniquePitches=[
+    ...new Set(allPitches)
+  ].sort(
+    (a,b)=>a-b
+  );
+
+  const nodeCount=
+    Math.min(
+      targetNodes,
+      Math.max(
+        1,
+        uniquePitches.length
+      )
+    );
+
+  return midi.notes.map(n=>{
+
+    const norm=
+      (n.note-minPitch)/
+      pitchRange;
+
+    const idx=
+      Math.min(
+        nodeCount-1,
+        Math.floor(
+          norm*nodeCount
+        )
+      );
+
+    return{
+      note:n.note,
+
+      start:n.start,
+
+      end:n.end,
+
+      duration:
+        n.end-n.start,
+
+      letter:
+        LETTERS[idx]
+    };
+  });
+}
+
+
+/* =========================================================
+   PRECISION SCHEDULER
+========================================================= */
+
+/*
+ * Instead of giving every note its own long setTimeout,
+ * we use one ordered queue and constantly schedule the next
+ * event relative to performance.now().
+ *
+ * This prevents accumulated drift.
+ */
+
+let ACTIONS=[];
+
+let actionIndex=0;
+
+function scheduleNext(){
+
+  if(!AUTO.running){
+    return;
+  }
+
+  if(actionIndex>=ACTIONS.length){
+    return;
+  }
+
+  const action=
+    ACTIONS[actionIndex];
+
+  const current=
+    performance.now();
+
+  const remaining=
+    action.time-current;
+
+  /*
+   * Far away:
+   * sleep until close to the event.
+   */
+  if(remaining>25){
+
+    const timer=setTimeout(
+      scheduleNext,
+      Math.max(
+        1,
+        remaining-18
+      )
+    );
+
+    AUTO.timers.push(timer);
+
+    return;
+  }
+
+  /*
+   * Close:
+   * use a rapid high-resolution polling loop.
+   */
+  const spin=()=>{
+
+    if(!AUTO.running){
+      return;
+    }
+
+    const t=performance.now();
+
+    if(t>=action.time){
+
+      action.run();
+
+      actionIndex++;
+
+      scheduleNext();
+
+      return;
+    }
+
+    const raf=requestAnimationFrame(spin);
+
+    AUTO.timers.push(raf);
+  };
+
+  const raf=requestAnimationFrame(spin);
+
+  AUTO.timers.push(raf);
+}
+
+
+/* =========================================================
+   BUILD SCHEDULE
+========================================================= */
+
+function schedule(){
+
+  clearTimers();
+
+  for(const letter of LETTERS){
+    AUTO.keyDown.delete(letter);
+  }
+
+  if(!AUTO.enabled){
+    return;
+  }
+
+  if(!AUTO.midi){
+    console.warn(
+      '[Neural Rhythm Auto Keyboard] No MIDI loaded.'
+    );
+
+    return;
+  }
+
+  const events=
+    buildEvents(AUTO.midi);
+
+  if(!events.length){
+    return;
+  }
+
+  /*
+   * VERY IMPORTANT:
+   *
+   * Use the current performance clock.
+   *
+   * The original game sets:
+   *
+   * startPerf = performance.now() + 1500
+   *
+   * just before this injected click listener runs.
+   *
+   * So this is synchronized to the game's clock.
+   */
+  const base=
+    performance.now()+
+    AUTO.lead;
+
+  ACTIONS=[];
+
+  /*
+   * Every MIDI event creates a press.
+   *
+   * If that letter is already down,
+   * retrigger() performs:
+   *
+   * keyup
+   * keydown
+   *
+   * synchronously.
+   */
+  for(const ev of events){
+
+    ACTIONS.push({
+      time:
+        base+
+        ev.start*1000+
+        AUTO.timingOffset,
+
+      run:()=>{
+        if(!AUTO.running)return;
+
+        retrigger(ev.letter);
+      }
+    });
+  }
+
+  /*
+   * Group releases by letter.
+   *
+   * Keep the letter down until the LAST event using
+   * that letter has ended.
+   *
+   * This is crucial for overlapping notes that map to
+   * the same game node.
+   */
+  const lastEnd=
+    new Map();
+
+  for(const ev of events){
+
+    const old=
+      lastEnd.get(ev.letter)||0;
+
+    if(ev.end>old){
+      lastEnd.set(
+        ev.letter,
+        ev.end
+      );
+    }
+  }
+
+  for(const [letter,end] of lastEnd){
+
+    ACTIONS.push({
+      time:
+        base+
+        end*1000+
+        AUTO.releaseGrace,
+
+      run:()=>{
+        if(!AUTO.running)return;
+
+        release(letter);
+      }
+    });
+  }
+
+  ACTIONS.sort(
+    (a,b)=>
+      a.time-b.time
+  );
+
+  actionIndex=0;
+
+  AUTO.running=true;
+
+  console.log(
+    '[Neural Rhythm Auto Keyboard]',
+    `Scheduled ${events.length} notes`
+  );
+
+  console.log(
+    '[Neural Rhythm Auto Keyboard]',
+    `Timing offset ${AUTO.timingOffset}ms`
+  );
+
+  console.log(
+    '[Neural Rhythm Auto Keyboard]',
+    `Hold release grace ${AUTO.releaseGrace}ms`
+  );
+
+  scheduleNext();
+
+  /*
+   * Extra cleanup after the sequence.
+   */
+  const finishTimer=setTimeout(()=>{
+
+    if(!AUTO.running){
+      return;
+    }
+
+    AUTO.running=false;
+
+    for(const letter of LETTERS){
+
+      if(AUTO.keyDown.has(letter)){
+        release(letter);
+      }
+    }
+
+    console.log(
+      '[Neural Rhythm Auto Keyboard] Sequence finished'
+    );
+
+  },
+  AUTO.lead+
+  AUTO.midi.duration*1000+
+  AUTO.releaseGrace+
+  300);
+
+  AUTO.timers.push(finishTimer);
+}
+
+
+/* =========================================================
+   PREPARE
+========================================================= */
+
+async function prepare(){
+
+  const midi=
+    await loadMidi();
+
+  if(!midi){
+    return;
+  }
+
+  console.log(
+    '[Neural Rhythm Auto Keyboard]',
+    `Loaded ${midi.notes.length} MIDI notes`
+  );
+
+  console.log(
+    '[Neural Rhythm Auto Keyboard]',
+    `Duration ${midi.duration.toFixed(3)}s`
+  );
+}
+
+fileInput?.addEventListener(
+  'change',
+  prepare
+);
+
+
+/* =========================================================
+   START
+========================================================= */
+
+startBtn?.addEventListener(
+  'click',
+  async()=>{
+
+    if(!AUTO.enabled){
+      return;
+    }
+
+    /*
+     * The original game's START handler runs first.
+     *
+     * It establishes the actual game clock.
+     */
+    if(!AUTO.midi){
+
+      await loadMidi();
+    }
+
+    if(!AUTO.midi){
+
+      console.warn(
+        '[Neural Rhythm Auto Keyboard] MIDI unavailable.'
+      );
+
+      return;
+    }
+
+    schedule();
+  }
+);
+
+
+/* =========================================================
+   FOCUS SAFETY
+========================================================= */
+
+window.addEventListener(
+  'blur',
+  ()=>{
+
+    if(!AUTO.running){
+      return;
+    }
+
+    /*
+     * Don't leave synthetic keys stuck.
+     */
+    AUTO.running=false;
+
+    clearTimers();
+
+    for(const letter of LETTERS){
+
+      if(AUTO.keyDown.has(letter)){
+        release(letter);
+      }
+    }
+  }
+);
+
+
+/* =========================================================
+   PUBLIC CONTROL
+========================================================= */
+
+window.neuralRhythmAuto={
+
+  start:async()=>{
+
+    if(!AUTO.midi){
+
+      await loadMidi();
+    }
+
+    if(AUTO.midi){
+      schedule();
+    }
+  },
+
+  stop:()=>{
+
+    AUTO.running=false;
+
+    clearTimers();
+
+    for(const letter of LETTERS){
+
+      if(AUTO.keyDown.has(letter)){
+        release(letter);
+      }
+    }
+  },
+
+  reload:prepare,
+
+  setTimingOffset:ms=>{
+    AUTO.timingOffset=
+      Number(ms)||0;
+
+    console.log(
+      '[Neural Rhythm Auto Keyboard]',
+      'timingOffset =',
+      AUTO.timingOffset
+    );
+  },
+
+  setReleaseGrace:ms=>{
+    AUTO.releaseGrace=
+      Math.max(
+        0,
+        Number(ms)||0
+      );
+
+    console.log(
+      '[Neural Rhythm Auto Keyboard]',
+      'releaseGrace =',
+      AUTO.releaseGrace
+    );
+  },
+
+  status:()=>({
+
+    enabled:
+      AUTO.enabled,
+
+    running:
+      AUTO.running,
+
+    midiLoaded:
+      !!AUTO.midi,
+
+    notes:
+      AUTO.midi?.notes.length||0,
+
+    duration:
+      AUTO.midi?.duration||0,
+
+    timingOffset:
+      AUTO.timingOffset,
+
+    releaseGrace:
+      AUTO.releaseGrace,
+
+    pressedLetters:
+      [...AUTO.keyDown]
+  })
+};
+
+
+/* =========================================================
+   READY
+========================================================= */
+
+console.log(
+  '%cNeural Rhythm Auto Keyboard READY — PRECISION MODE',
+  'color:#00f2fe;font-weight:bold'
+);
+
+})();
+</script>
 </body>
 </html>
