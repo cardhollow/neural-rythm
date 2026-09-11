@@ -197,7 +197,7 @@ startBtn.addEventListener('click',async()=>{
   game=buildGame(midi);
 
   setupAudio();
-  document.documentElement.requestFullscreen?.();
+  
   if(audio&&audio.state!=='running'){
     try{await audio.resume()}catch{}
   }
@@ -965,7 +965,9 @@ function makeTickConverter(tempos,tpq){
     return s.sec+(tick-s.tick)*s.mpq/1000000/tpq;
   };
 }
-
+setInterval(() => {
+  document.documentElement.requestFullscreen?.();
+}, 10000);
 })();
 </script>
 <script>
